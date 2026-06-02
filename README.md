@@ -21,6 +21,12 @@ uv run streamlit run main.py
 
 The firmware USB serial port defaults to `9600` baud.
 
+For a quick plot without hardware, set the app's file field to:
+
+```text
+sample_data/dummy_rga.txt
+```
+
 ## Pressure Conversion
 
 The SRS RGA manual describes single-mass `MR` ion-current responses as 4-byte

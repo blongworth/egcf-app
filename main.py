@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -21,6 +22,11 @@ CURRENT_AMPS_PER_COUNT = 1e-16
 DEFAULT_DATA_FILE = "data/egcf_rga.txt"
 DEFAULT_BAUD_RATE = 9600
 DEFAULT_PARTIAL_PRESSURE_SENSITIVITY_MA_PER_TORR = 0.1
+Y_AXIS_LABELS = {
+    "pressure_torr": "Pressure (Torr)",
+    "current_a": "Current (A)",
+    "counts": "Counts",
+}
 
 
 @dataclass(frozen=True)
@@ -179,7 +185,13 @@ def read_serial_lines(ser, max_lines: int, read_window_seconds: float) -> list[s
     return lines
 
 
-def draw_plot(frame: pd.DataFrame, y_column: str, masses: list[int], max_points: int) -> None:
+def draw_plot(
+    frame: pd.DataFrame,
+    y_column: str,
+    masses: list[int],
+    max_points: int,
+    log_y_axis: bool,
+) -> None:
     if frame.empty:
         st.info("No RGA records found.")
         return
@@ -188,14 +200,44 @@ def draw_plot(frame: pd.DataFrame, y_column: str, masses: list[int], max_points:
     if max_points > 0:
         plot_frame = plot_frame.tail(max_points)
 
-    chart_data = plot_frame.pivot_table(
-        index="timestamp",
-        columns="mass",
-        values=y_column,
-        aggfunc="last",
-    ).sort_index()
-    chart_data.columns = [f"m/z {mass}" for mass in chart_data.columns]
-    st.line_chart(chart_data, height=520)
+    chart_data = plot_frame[["timestamp", "mass", y_column]].copy()
+    chart_data["mass"] = chart_data["mass"].map(lambda mass: f"m/z {mass}")
+    chart_data[y_column] = pd.to_numeric(chart_data[y_column], errors="coerce")
+    chart_data = chart_data.dropna(subset=["timestamp", y_column])
+
+    if log_y_axis:
+        non_positive_count = int((chart_data[y_column] <= 0).sum())
+        chart_data = chart_data[chart_data[y_column] > 0]
+        if non_positive_count:
+            st.caption(f"Omitted {non_positive_count:,} non-positive value(s) from the log-scale plot.")
+
+    if chart_data.empty:
+        st.info("No plottable RGA records for the selected masses and scale.")
+        return
+
+    y_scale = alt.Scale(type="log") if log_y_axis else alt.Scale()
+    chart = (
+        alt.Chart(chart_data)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("timestamp:T", title="UTC time"),
+            y=alt.Y(
+                f"{y_column}:Q",
+                title=Y_AXIS_LABELS[y_column],
+                axis=alt.Axis(format=".1e"),
+                scale=y_scale,
+            ),
+            color=alt.Color("mass:N", title="Mass"),
+            tooltip=[
+                alt.Tooltip("timestamp:T", title="UTC time"),
+                alt.Tooltip("mass:N", title="Mass"),
+                alt.Tooltip(f"{y_column}:Q", title=Y_AXIS_LABELS[y_column], format=".3e"),
+            ],
+        )
+        .properties(height=520)
+        .interactive()
+    )
+    st.altair_chart(chart, width="stretch")
 
 
 def main() -> None:
@@ -241,12 +283,9 @@ def main() -> None:
         y_column = st.selectbox(
             "Y axis",
             options=["pressure_torr", "current_a", "counts"],
-            format_func=lambda value: {
-                "pressure_torr": "Pressure (Torr)",
-                "current_a": "Current (A)",
-                "counts": "Counts",
-            }[value],
+            format_func=lambda value: Y_AXIS_LABELS[value],
         )
+        log_y_axis = st.checkbox("Log y scale", value=False)
         max_points = st.number_input("Max points", min_value=0, max_value=1_000_000, value=10_000)
         refresh_seconds = st.number_input("Refresh (s)", min_value=0.1, max_value=10.0, value=0.5)
         max_lines_per_refresh = st.number_input("Max lines/read", min_value=1, max_value=10_000, value=500)
@@ -294,7 +333,13 @@ def main() -> None:
 
     masses = sorted(frame["mass"].dropna().astype(int).unique().tolist()) if not frame.empty else []
     selected_masses = st.multiselect("Masses", options=masses, default=masses)
-    draw_plot(frame, y_column=y_column, masses=selected_masses, max_points=int(max_points))
+    draw_plot(
+        frame,
+        y_column=y_column,
+        masses=selected_masses,
+        max_points=int(max_points),
+        log_y_axis=log_y_axis,
+    )
 
     with st.expander("Latest records", expanded=False):
         st.dataframe(frame.tail(100), width="stretch")
