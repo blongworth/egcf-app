@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterable
 
 import altair as alt
-import pandas as pd
+import polars as pl
 import streamlit as st
 
 try:
@@ -99,7 +99,7 @@ def records_to_frame(
     records: Iterable[RgaRecord],
     sensitivity_ma_per_torr: float,
     detector_gain: float,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     data = [
         {
             "timestamp": record.timestamp,
@@ -110,20 +110,37 @@ def records_to_frame(
         for record in records
     ]
     if not data:
-        return pd.DataFrame(
-            columns=["timestamp", "mass", "counts", "current_a", "pressure_torr", "raw_line"]
+        return pl.DataFrame(
+            schema={
+                "timestamp": pl.Datetime(time_zone="UTC"),
+                "mass": pl.Int64,
+                "counts": pl.Int64,
+                "current_a": pl.Float64,
+                "pressure_torr": pl.Float64,
+                "raw_line": pl.String,
+            }
         )
-
-    frame = pd.DataFrame(data)
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
-    frame = frame.dropna(subset=["timestamp"])
-    frame["current_a"] = frame["counts"] * CURRENT_AMPS_PER_COUNT
 
     sensitivity_a_per_torr = sensitivity_ma_per_torr * 1e-3
     divisor = sensitivity_a_per_torr * detector_gain
-    frame["pressure_torr"] = frame["current_a"] / divisor if divisor > 0 else pd.NA
-    frame = frame.sort_values(["timestamp", "mass"]).reset_index(drop=True)
-    return frame
+    pressure_expr = (
+        (pl.col("current_a") / divisor)
+        if divisor > 0
+        else pl.lit(None, dtype=pl.Float64)
+    )
+
+    return (
+        pl.DataFrame(data)
+        .with_columns(
+            pl.col("timestamp").str.to_datetime(time_zone="UTC", strict=False),
+            pl.col("mass").cast(pl.Int64),
+            pl.col("counts").cast(pl.Int64),
+        )
+        .filter(pl.col("timestamp").is_not_null())
+        .with_columns((pl.col("counts") * CURRENT_AMPS_PER_COUNT).alias("current_a"))
+        .with_columns(pressure_expr.alias("pressure_torr"))
+        .sort(["timestamp", "mass"])
+    )
 
 
 def append_rga_lines(path: Path, records: Iterable[RgaRecord]) -> int:
@@ -186,32 +203,36 @@ def read_serial_lines(ser, max_lines: int, read_window_seconds: float) -> list[s
 
 
 def draw_plot(
-    frame: pd.DataFrame,
+    frame: pl.DataFrame,
     y_column: str,
     masses: list[int],
     max_points: int,
     log_y_axis: bool,
 ) -> None:
-    if frame.empty:
+    if frame.is_empty():
         st.info("No RGA records found.")
         return
 
-    plot_frame = frame[frame["mass"].isin(masses)] if masses else frame
+    plot_frame = frame.filter(pl.col("mass").is_in(masses)) if masses else frame
     if max_points > 0:
         plot_frame = plot_frame.tail(max_points)
 
-    chart_data = plot_frame[["timestamp", "mass", y_column]].copy()
-    chart_data["mass"] = chart_data["mass"].map(lambda mass: f"m/z {mass}")
-    chart_data[y_column] = pd.to_numeric(chart_data[y_column], errors="coerce")
-    chart_data = chart_data.dropna(subset=["timestamp", y_column])
+    chart_data = (
+        plot_frame.select(["timestamp", "mass", y_column])
+        .with_columns(
+            pl.format("m/z {}", pl.col("mass")).alias("mass"),
+            pl.col(y_column).cast(pl.Float64, strict=False),
+        )
+        .drop_nulls(["timestamp", y_column])
+    )
 
     if log_y_axis:
-        non_positive_count = int((chart_data[y_column] <= 0).sum())
-        chart_data = chart_data[chart_data[y_column] > 0]
+        non_positive_count = chart_data.filter(pl.col(y_column) <= 0).height
+        chart_data = chart_data.filter(pl.col(y_column) > 0)
         if non_positive_count:
             st.caption(f"Omitted {non_positive_count:,} non-positive value(s) from the log-scale plot.")
 
-    if chart_data.empty:
+    if chart_data.is_empty():
         st.info("No plottable RGA records for the selected masses and scale.")
         return
 
@@ -326,12 +347,17 @@ def main() -> None:
     frame = records_to_frame(records, sensitivity_ma_per_torr=float(sensitivity), detector_gain=float(detector_gain))
 
     metrics = st.columns(4)
-    metrics[0].metric("Records", f"{len(frame):,}")
-    metrics[1].metric("Masses", f"{frame['mass'].nunique() if not frame.empty else 0:,}")
-    metrics[2].metric("Latest UTC", "n/a" if frame.empty else frame["timestamp"].max().isoformat())
+    latest_timestamp = frame.select(pl.col("timestamp").max()).item() if not frame.is_empty() else None
+    metrics[0].metric("Records", f"{frame.height:,}")
+    metrics[1].metric("Masses", f"{frame.select(pl.col('mass').n_unique()).item() if not frame.is_empty() else 0:,}")
+    metrics[2].metric("Latest UTC", "n/a" if latest_timestamp is None else latest_timestamp.isoformat())
     metrics[3].metric("File", str(data_file))
 
-    masses = sorted(frame["mass"].dropna().astype(int).unique().tolist()) if not frame.empty else []
+    masses = (
+        frame.select(pl.col("mass").drop_nulls().unique().sort()).to_series().to_list()
+        if not frame.is_empty()
+        else []
+    )
     selected_masses = st.multiselect("Masses", options=masses, default=masses)
     draw_plot(
         frame,
